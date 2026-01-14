@@ -76,55 +76,62 @@ jobs:
           export LANG=C.UTF-8
           export LC_ALL=C.UTF-8
 
-          # 获取最新的 md 和 png
-          REPORT_FILE=$(ls -1t reports/*.md 2>/dev/null | head -n 1 || true)
-          CHART_FILE=$(ls -1t reports/*.png 2>/dev/null | head -n 1 || true)
+          echo "=== Debug: 检查生成的文件 ==="
+          ls -lh reports/ || echo "reports 目录为空"
+
+          # 1. 安全地查找最新的 Report (.md)
+          # 使用 find 避免 ls 的 alias 干扰
+          REPORT_FILE=$(find reports -name "*.md" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
+          
+          # 2. 安全地查找最新的 Chart (.png) 并转为绝对路径
+          CHART_FILE=$(find reports -name "*.png" -type f -printf "%T@ %p\n" | sort -n | tail -1 | cut -d' ' -f2-)
 
           if [ -z "${REPORT_FILE:-}" ]; then
-            echo "没有找到报告文件，跳过通知。"
+            echo "::warning::没有找到报告文件，跳过通知。"
             exit 0
+          fi
+
+          # 获取绝对路径 (Real Path)，解决 curl 读取不到的问题
+          if [ -n "${CHART_FILE:-}" ]; then
+             CHART_ABS_PATH=$(readlink -f "$CHART_FILE")
+             echo "Found Chart (Absolute): $CHART_ABS_PATH"
           fi
 
           echo "Found Report: $REPORT_FILE"
 
-          # === 修正点：参数必须放在 <<'PY' 之前 ===
+          # 3. 生成 Caption (注意：参数放在 <<'PY' 之前)
           CAPTION="$(python - "$REPORT_FILE" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" <<'PY'
           import pathlib, sys
           
-          # 此时 sys.argv[1] 就能正确获取到 $REPORT_FILE 了
           path = sys.argv[1]
-          
           try:
               text = pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
               lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
               
-              # 1. 提取标题 (第一行，去掉 #)
+              # 提取标题和摘要
               title = lines[0].lstrip("#").strip() if lines else "AI Analysis"
-              
-              # 2. 提取摘要 (跳过前2行：标题和图片链接)
-              # 取正文的前 850 个字符，防止超长
               body_lines = lines[2:40] 
               summary = "\n".join(body_lines)[:850]
               
-              # 3. 生成页脚链接
-              link = f"Repo: {sys.argv[2]}/{sys.argv[3]}"
-              
               print(f"<b>{title}</b>\n\n{summary}\n\n... <a href='https://github.com/{sys.argv[2]}/{sys.argv[3]}'>查看完整版</a>")
           except Exception as e:
-              # 如果出错，打印一个简单的 fallback 文本
               print(f"Error parsing report: {e}")
           PY
           )"
 
-          echo "发送 Telegram 通知..."
+          echo "=== 开始发送 Telegram ==="
           
-          if [ -n "${CHART_FILE:-}" ] && [ -f "$CHART_FILE" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
+          # 4. 发送逻辑 (区分有图/无图)
+          if [ -n "${CHART_ABS_PATH:-}" ] && [ -f "$CHART_ABS_PATH" ]; then
+            echo "检测到图片，正在发送 Photo..."
+            # 使用绝对路径，并引用变量防止文件名空格
+            curl -s -v -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto" \
               -F "chat_id=${TG_CHAT_ID}" \
-              -F "photo=@${CHART_FILE}" \
+              -F "photo=@${CHART_ABS_PATH}" \
               -F "parse_mode=HTML" \
               -F "caption=${CAPTION}"
           else
+            echo "未检测到图片或图片无效，发送纯文本..."
             curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT_ID}" \
               -d "parse_mode=HTML" \
