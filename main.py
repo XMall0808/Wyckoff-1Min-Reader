@@ -1,11 +1,12 @@
 import os
 import time
+import json
+import requests
 from datetime import datetime
 import pandas as pd
 import akshare as ak
 import mplfinance as mpf
 from openai import OpenAI
-import google.generativeai as genai  # 新增 Gemini 库
 
 # ==========================================
 # 1. 数据获取模块
@@ -79,14 +80,13 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str):
         print(f"[Error] 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (双引擎：Gemini -> OpenAI)
+# 3. AI 分析模块 (Gemini HTTP -> Official OpenAI)
 # ==========================================
 
 def get_prompt_content(symbol, df):
     """读取并填充 Prompt 模板"""
     prompt_template = os.getenv("WYCKOFF_PROMPT_TEMPLATE")
     
-    # 本地回退
     if not prompt_template and os.path.exists("prompt_secret.txt"):
         try:
             with open("prompt_secret.txt", "r", encoding="utf-8") as f:
@@ -104,37 +104,59 @@ def get_prompt_content(symbol, df):
                           .replace("{latest_price}", str(latest["close"])) \
                           .replace("{csv_data}", csv_data)
 
-def call_gemini(prompt: str) -> str:
-    """调用 Google Gemini"""
+def call_gemini_http(prompt: str) -> str:
+    """
+    使用 HTTP POST 直接调用 Gemini API (避开 SDK 兼容性问题)
+    """
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY not found")
 
     model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-    print(f"   >>> 尝试调用 Google Gemini ({model_name})...")
-    
-    genai.configure(api_key=api_key)
-    # Gemini 1.5 支持 system instruction，更适合角色扮演
-    model = genai.GenerativeModel(
-        model_name,
-        system_instruction="You are Richard D. Wyckoff. You follow strict Wyckoff logic."
-    )
-    
-    response = model.generate_content(prompt)
-    return response.text
+    print(f"   >>> 尝试调用 Google Gemini (HTTP Direct: {model_name})...")
 
-def call_openai(prompt: str) -> str:
-    """调用 OpenAI / DeepSeek (备用)"""
+    # 构建 REST API URL
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    
+    headers = {'Content-Type': 'application/json'}
+    data = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        # Gemini 1.5 支持 system instruction
+        "system_instruction": {
+            "parts": [{"text": "You are Richard D. Wyckoff. You follow strict Wyckoff logic."}]
+        },
+        "generationConfig": {
+            "temperature": 0.2
+        }
+    }
+
+    # 发送请求
+    resp = requests.post(url, headers=headers, json=data)
+    
+    if resp.status_code != 200:
+        raise Exception(f"Gemini API Error {resp.status_code}: {resp.text}")
+    
+    # 解析结果
+    result = resp.json()
+    try:
+        return result['candidates'][0]['content']['parts'][0]['text']
+    except (KeyError, IndexError):
+        raise Exception(f"解析 Gemini 响应失败: {result}")
+
+def call_openai_official(prompt: str) -> str:
+    """调用官方 OpenAI API"""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY not found")
         
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    # 不再读取 Base URL，使用官方默认值
     model_name = os.getenv("AI_MODEL", "gpt-4o")
     
-    print(f"   >>> 尝试调用 OpenAI/Compatible ({model_name})...")
+    print(f"   >>> 尝试调用 Official OpenAI ({model_name})...")
     
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    client = OpenAI(api_key=api_key) # 默认连接 api.openai.com
     resp = client.chat.completions.create(
         model=model_name, 
         messages=[
@@ -152,18 +174,18 @@ def ai_analyze_wyckoff(symbol: str, df: pd.DataFrame) -> str:
     if not prompt:
         return "错误：未找到 WYCKOFF_PROMPT_TEMPLATE，无法分析。"
 
-    # === 策略：首选 Gemini，失败后降级 ===
+    # === 策略：首选 Gemini，失败后降级到 OpenAI ===
     
     # 1. 尝试 Gemini
     try:
-        return call_gemini(prompt)
+        return call_gemini_http(prompt)
     except Exception as e:
         print(f"[Warning] Gemini 调用失败: {e}")
-        print("正在切换到备用通道 (OpenAI/DeepSeek)...")
+        print("正在切换到备用通道 (Official OpenAI)...")
 
     # 2. 尝试 OpenAI (Fallback)
     try:
-        return call_openai(prompt)
+        return call_openai_official(prompt)
     except Exception as e:
         error_msg = f"# 分析失败\n\nGemini 和 OpenAI 均无法响应。\n最后错误: `{e}`"
         print(f"[Error] 所有 AI 通道均失败: {e}")
@@ -182,11 +204,10 @@ def main():
         print("!!!" * 10)
         print(f"[错误] {symbol} 数据获取失败 (Empty DataFrame)")
         print("!!!" * 10)
-        exit(1) # 强制报错让 Actions 变红
+        exit(1)
         
     df = add_indicators(df)
 
-    # 目录准备
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
