@@ -13,50 +13,31 @@ from sheet_manager import SheetManager
 import concurrent.futures 
 
 # ==========================================
-# 1. 数据获取模块
+# 1. 数据获取模块 (固定 500根 5min)
 # ==========================================
 
 def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     symbol_code = clean_digits.zfill(6)
     
-    # 1. 计算时间窗口 (增强容错：如果是空日期，默认取最近15天)
-    start_date_em = (datetime.now() - timedelta(days=15)).strftime("%Y%m%d") # 默认值
-    
-    try:
-        # 只有当日期字符串有效且长度足够时，才尝试解析
-        if buy_date_str and str(buy_date_str).lower() != 'nan' and len(str(buy_date_str)) >= 10:
-            buy_dt = datetime.strptime(str(buy_date_str)[:10], "%Y-%m-%d")
-            start_dt = buy_dt - timedelta(days=15) 
-            start_date_em = start_dt.strftime("%Y%m%d")
-            # print(f"   📅 根据买入日期 [{str(buy_date_str)[:10]}] 回溯数据")
-    except Exception as e:
-        # 解析失败也不要紧，就用默认的15天
-        pass
+    # === 核心修改：固定获取策略 ===
+    # 5分钟K线，每天48根。500根大约需要 10.5 个交易日。
+    # 为了保险（考虑周末、节假日），我们直接向前推 40 天，保证数据够多。
+    start_date_em = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d")
 
-    # 2. 优先拉取 5分钟 K线
+    # print(f"   -> 正在获取 {symbol_code} 5分钟数据 (Limit: 500)...")
+
     try:
+        # 获取 5分钟 数据
         df = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="5", start_date=start_date_em, adjust="qfq")
     except Exception as e:
-        print(f"   [Error] {symbol_code} 5min接口报错: {e}")
+        print(f"   [Error] {symbol_code} AkShare接口报错: {e}")
         return {"df": pd.DataFrame(), "period": "5m"}
 
     if df.empty:
         return {"df": pd.DataFrame(), "period": "5m"}
 
-    # 3. 策略切换 (数据量大时切15分钟)
-    current_period = "5m"
-    if len(df) > 960:
-        try:
-            df_15 = ak.stock_zh_a_hist_min_em(symbol=symbol_code, period="15", adjust="qfq")
-            rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
-            df_15 = df_15.rename(columns={k: v for k, v in rename_map.items() if k in df_15.columns})
-            df = df_15.tail(960).reset_index(drop=True) 
-            current_period = "15m"
-        except:
-            df = df.tail(960)
-
-    # 4. 数据清洗
+    # === 数据清洗 ===
     rename_map = {"时间": "date", "开盘": "open", "最高": "high", "最低": "low", "收盘": "close", "成交量": "volume"}
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
     
@@ -66,12 +47,17 @@ def fetch_stock_data_dynamic(symbol: str, buy_date_str: str) -> dict:
     valid_cols = [c for c in cols if c in df.columns]
     df[valid_cols] = df[valid_cols].astype(float)
 
+    # 修复开盘价为0
     if "open" in df.columns and (df["open"] == 0).any():
         df["open"] = df["open"].replace(0, np.nan)
         if "close" in df.columns:
             df["open"] = df["open"].fillna(df["close"].shift(1)).fillna(df["close"])
 
-    return {"df": df, "period": current_period}
+    # === 核心修改：强制截取最后 500 根 ===
+    if len(df) > 500:
+        df = df.tail(500).reset_index(drop=True)
+    
+    return {"df": df, "period": "5m"}
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -96,12 +82,16 @@ def generate_local_chart(symbol: str, df: pd.DataFrame, save_path: str, period: 
     if 'ma200' in plot_df.columns: apds.append(mpf.make_addplot(plot_df['ma200'], color='#2196f3', width=2.0))
 
     try:
-        mpf.plot(plot_df, type='candle', style=s, addplot=apds, volume=True, title=f"Wyckoff: {symbol} ({period})", savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'), warn_too_much_data=2000)
+        # title 增加显示 bar count
+        mpf.plot(plot_df, type='candle', style=s, addplot=apds, volume=True, 
+                 title=f"Wyckoff: {symbol} ({period} | {len(plot_df)} bars)", 
+                 savefig=dict(fname=save_path, dpi=150, bbox_inches='tight'), 
+                 warn_too_much_data=2000)
     except Exception as e:
         print(f"   [Error] {symbol} 绘图失败: {e}")
 
 # ==========================================
-# 3. AI 分析模块 (Fail Fast 策略)
+# 3. AI 分析模块 (Fail Fast & Auto-Fallback)
 # ==========================================
 
 def get_prompt_content(symbol, df, position_info):
@@ -121,7 +111,6 @@ def get_prompt_content(symbol, df, position_info):
                           .replace("{latest_price}", str(latest["close"])) \
                           .replace("{csv_data}", csv_data)
     
-    # 增强容错：如果字典里是 None 或 nan，转为 'N/A'
     def safe_get(key):
         val = position_info.get(key)
         if val is None or str(val).lower() == 'nan' or str(val).strip() == '':
@@ -167,11 +156,9 @@ def call_gemini_http(prompt: str) -> str:
         "safetySettings": safety_settings 
     }
     
-    # === Retry Logic (只重试网络错误，不重试 429) ===
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            # 180s 超时
             resp = requests.post(url, headers=headers, json=data, timeout=180)
             
             if resp.status_code == 200:
@@ -190,11 +177,11 @@ def call_gemini_http(prompt: str) -> str:
                 
                 return text 
             
-            # 🛑 遇到 429 (限流) -> 直接抛异常，切 OpenAI
+            # 429 Limit -> 直接切 OpenAI
             elif resp.status_code == 429:
-                raise Exception(f"Gemini 429 Rate Limit Reached: {resp.text[:100]}")
+                raise Exception(f"Gemini 429 Rate Limit: {resp.text[:100]}")
 
-            # 503 过载 -> 小睡一下再试
+            # 503 Overload -> 重试
             elif resp.status_code == 503:
                 print(f"   ⚠️ Gemini 503 Overloaded... Waiting 5s")
                 time.sleep(5)
@@ -204,10 +191,7 @@ def call_gemini_http(prompt: str) -> str:
                 raise Exception(f"HTTP {resp.status_code}: {resp.text}")
 
         except Exception as e:
-            # 如果是 429 异常，直接往上抛，不要重试
-            if "429" in str(e):
-                raise e
-                
+            if "429" in str(e): raise e
             if attempt == max_retries - 1:
                 print(f"   ❌ Gemini Final Fail: {e}")
                 raise e
@@ -237,8 +221,7 @@ def ai_analyze(symbol, df, position_info):
     try: 
         return call_gemini_http(prompt)
     except Exception as e: 
-        # 打印简单错误信息，避免刷屏
-        print(f"   ⚠️ [{symbol}] Gemini 失败 (转切 OpenAI): {str(e)[:100]}...")
+        print(f"   ⚠️ [{symbol}] Gemini 失败 (转切 OpenAI): {str(e)[:80]}...")
         try: 
             return call_openai_official(prompt)
         except Exception as e2: 
@@ -282,14 +265,11 @@ def generate_pdf_report(symbol, chart_path, report_text, pdf_path):
     except: return False
 
 # ==========================================
-# 5. 主程序
+# 5. 主程序 (串行处理)
 # ==========================================
 
 def process_one_stock(symbol: str, position_info: dict):
-    # 【修复】防止 position_info 为 None 导致崩溃
-    if position_info is None:
-        position_info = {}
-
+    if position_info is None: position_info = {}
     clean_digits = ''.join(filter(str.isdigit, str(symbol)))
     clean_symbol = clean_digits.zfill(6)
 
@@ -338,8 +318,7 @@ def main():
 
     generated_pdfs = []
     
-    # ⚠️ 【关键修改】改为单线程 (max_workers=1)
-    # 避免并发触发 Rate Limit
+    # 串行处理 (Max Workers = 1)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future_to_symbol = {
             executor.submit(process_one_stock, symbol, info): symbol 
