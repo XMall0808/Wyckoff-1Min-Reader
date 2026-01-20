@@ -1,10 +1,10 @@
 name: Daily Stock AI Report
 
 on:
-  workflow_dispatch:      # 允许手动触发
+  workflow_dispatch:
   schedule:
-    - cron: "0 4 * * *"   # UTC 04:00 = 北京时间 12:00 (午盘)
-    - cron: "15 7 * * *"  # UTC 07:15 = 北京时间 15:15 (收盘)
+    - cron: "0 4 * * *"   # 北京时间 12:00
+    - cron: "15 7 * * *"  # 北京时间 15:15
 
 permissions:
   contents: write
@@ -22,7 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # === 1. 安装系统依赖 (中文字体 + PDF底层库) ===
       - name: Install System Dependencies
         run: |
           sudo apt-get update
@@ -34,44 +33,34 @@ jobs:
         with:
           python-version: "3.11"
 
-      # === 2. 安装 Python 依赖 ===
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # 👇 注意：这里删掉了 oauth2client，千万别装它！
-          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread
+          pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread google-auth
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-          
-      # === 3. 运行分析脚本 (连接 Google Sheets) ===
       - name: Run Analysis Script
         env:
-          # Google Gemini 配置
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: "gemini-3-flash"
-          # OpenAI 配置
+          # 👇 【已更新】指定为 gemini-3-flash-preview
+          GEMINI_MODEL: "gemini-3-flash-preview"
+          
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: "gpt-4o"
-          # 通用配置
           WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
           BARS_COUNT: "600"
-          
-          # === 👇 核心修复：必须传入 Google Sheets 密钥 ===
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
-          
         run: |
           mkdir -p data reports
           python main.py
 
-      # === 4. 清理 7 天前的旧数据 ===
       - name: Cleanup old data
         run: |
           echo "Cleaning up files older than 7 days..."
           find reports/ -name "*.*" -type f -mtime +7 -print -delete
           find data/ -name "*.csv" -type f -mtime +7 -print -delete
 
-      # === 5. 提交新生成的 PDF 和 CSV 到仓库 (保存历史记录) ===
       - name: Commit and push changes
         run: |
           git config user.name "github-actions[bot]"
@@ -85,7 +74,6 @@ jobs:
             git push origin HEAD:main
           fi
 
-     # === 6. 推送报告 (修复版：去除了Emoji，简化了引号逻辑) ===
       - name: Notify Telegram (Push List)
         if: success()
         env:
@@ -93,43 +81,24 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         shell: bash
         run: |
-          # 开启错误检测，但允许 read 返回非零（处理最后一行）
           set -u
-          
           if [ ! -f push_list.txt ]; then
-            echo "::warning::File push_list.txt not found, skipping."
+            echo "::warning::File push_list.txt not found."
             exit 0
           fi
           
-          echo "=== Start Pushing Files ==="
-          
-          # 使用更安全的循环方式读取文件
+          echo "=== Start Pushing ==="
           while IFS= read -r PDF_FILE || [ -n "$PDF_FILE" ]; do
-            # 去除首尾空白符
             PDF_FILE=$(echo "$PDF_FILE" | xargs)
-            
-            # 检查文件是否存在且不为空
             if [ -n "$PDF_FILE" ] && [ -f "$PDF_FILE" ]; then
-              echo "----------------------------------------"
               echo "Sending: $PDF_FILE"
-              
-              # 提取文件名
               FILENAME=$(basename "$PDF_FILE")
-              # 定义 Caption 变量 (不含特殊字符，纯英文)
-              CAPTION="Analysis Report: $FILENAME"
+              CAPTION="Analysis: $FILENAME"
               
-              # 执行发送 (分行写，注意反斜杠后不能有空格)
-              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${TG_CHAT_ID}" \
-                -F "document=@$PDF_FILE" \
-                -F "caption=$CAPTION"
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" -F "chat_id=${TG_CHAT_ID}" -F "document=@$PDF_FILE" -F "caption=$CAPTION"
                 
-              echo "Sent successfully."
-              # 避免发送太快触发限制
+              echo "Sent."
               sleep 3
-            else
-              echo "File not found or empty: $PDF_FILE"
             fi
           done < push_list.txt
-          
           echo "=== Finished ==="
