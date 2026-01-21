@@ -36,30 +36,32 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # ✅ 确保包含 baostock
+          # 确保包含 baostock
           pip install pandas akshare mplfinance openai requests markdown xhtml2pdf gspread google-auth baostock
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Analysis Script
         env:
-          # 👇 1. 强制实时日志 (不再缓存输出，方便调试)
           PYTHONUNBUFFERED: "1"
 
-          # 👇 2. Gemini 配置
+          # === 1. Google 官方 Gemini 配置 ===
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          # ⚠️ 建议改回 gemini-1.5-flash，因为 3-flash 每天只有20次额度，很容易不够用
-          GEMINI_MODEL: "gemini-3-flash-preview" 
+          GEMINI_MODEL: "gemini-3-flash-preview"
           
-          # 👇 3. 抗 429/503 核心配置 (对应 main.py 中的逻辑)
-          GEMINI_MAX_RETRIES: "3"     # 增加重试次数 (原默认3)
-          GEMINI_BASE_SLEEP: "5"      # 基础等待时间拉长到3秒 (原默认2.5)，给服务器更多喘息时间
-          GEMINI_TIMEOUT: "300"        # 单次请求超时时间 (1分钟)
+          # ✅ 修改点：按您要求，最多重试 1 次，快速失败切换下一级
+          GEMINI_MAX_RETRIES: "1"
+          GEMINI_BASE_SLEEP: "3"
+          GEMINI_TIMEOUT: "120"
 
-          # 👇 4. OpenAI 兜底配置
+          # === 2. 自定义 API (Qiandao) 配置 ===
+          # ⚠️ 记得去 GitHub Secrets 添加 CUSTOM_API_KEY
+          CUSTOM_API_KEY: ${{ secrets.CUSTOM_API_KEY }}
+
+          # === 3. OpenAI/DeepSeek 兜底配置 ===
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AI_MODEL: "gpt-4o"
           
-          # 👇 5. 业务配置
+          # === 业务配置 ===
           WYCKOFF_PROMPT_TEMPLATE: ${{ secrets.WYCKOFF_PROMPT_TEMPLATE }}
           BARS_COUNT: "600"
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
@@ -108,7 +110,6 @@ jobs:
               FILENAME=$(basename "$PDF_FILE")
               CAPTION="Analysis: $FILENAME"
               
-              # 增加重试机制防止 TG 推送偶尔失败
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendDocument" \
                    -F "chat_id=${TG_CHAT_ID}" \
                    -F "document=@$PDF_FILE" \
